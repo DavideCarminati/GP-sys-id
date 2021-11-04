@@ -142,8 +142,8 @@ pwm_l = pwm_l/20000;
 % t = t(1:2:60);
 
 % Sys Id parameters
-delay_y = 2;%3;
-delay_u = 2;%1;
+delay_y = 3;
+delay_u = 1;
 delay_max = max(delay_y, delay_u);
 
 % Building basis vector
@@ -159,7 +159,7 @@ y_basis = omega_l(delay_y+1:end,1);
 
 % But what if I use a ndgrid??
 
-x_int = linspace(0, 0.5, 5);
+x_int = linspace(-1, 1, 7);
 [ x1, x2, x3, x4 ] = ndgrid(x_int, x_int, x_int, x_int);
 basisVector = [ x1(:), x2(:), x3(:), x4(:) ];
 ts = 1:length(basisVector);
@@ -173,14 +173,14 @@ ts = 1:length(basisVector);
 % load('test_5.mat')
 % load('test_7.mat')
 % load('test_8.mat')
-% load('test_9.mat')
-% omegal1 = omega_l;
-% pwm_l1 = pwm_l;
-% t1 = t;
+load('test_9.mat')
+omegal1 = omega_l;
+pwm_l1 = pwm_l;
+t1 = t;
 load('test_10.mat')
-% omega_l = [omegal1; omega_l];
-% pwm_l = [pwm_l1; pwm_l];
-% t = [ t1; t ];
+omega_l = [omegal1; omega_l];
+pwm_l = [pwm_l1; pwm_l];
+t = [ t1; t ];
 
 % Normalize
 omega_l = omega_l/20;
@@ -247,7 +247,7 @@ ys = reshape(ys, batch_size, []);
 % l = 1.06e4;
 % l = 0.8899;
 l = 5;
-l = [2 2 2 0.8];
+l = [1.5 1.5 1.5 0.8];
 % l = 5.6067e3;
 sigm = 0.8;
 mu_g_old = zeros(length(ts),1); % Initial condition on ypred
@@ -258,6 +258,7 @@ Cg_old = 10e2*eye(length(ts));
 % Cg_old(1:length(ysd),1:length(ysd)) = diag(ysd);
 
 % Recursion
+
 K = kernelFnct(basisVector, basisVector, l, sigm);
 K = K + 4e-4*ones(size(K,1)); % Adding noise to kernel
 inv_K = inv(K);
@@ -313,16 +314,64 @@ for ii = 1:size(batchVector2,2)-1
     pause(0.5);
 end
 
+%% Online parameters learning
 
+mu_eta_old = zeros(5,1);
+C_eta_old = 1e2*eye(5);
+eta_old = ones(5,1); % Old parameter estimate
+
+% Matrix Cz
+Cg_eta_old = zeros(size(basisVector,1), size(eta_old,1));
+C_eta_old = zeros(size(eta_old,1));
+C_eta_g_old = zeros(size(eta_old,1),size(basisVector,1));
+Cg_old = 1e2*eye(size(basisVector, 1));
+
+for ii = 1:size(batchVector2,2)-1
+
+    batch = batchVector2{ii};
+    Y = ys(:,ii);
+    K = kernelFnct(basisVector, basisVector, eta_old(1:4), eta_old(end));
+    Ks = kernelFnct(batch, basisVector, eta_old(1:4), eta_old(end));
+    Kss = kernelFnct(batch, batch, eta_old(1:4), eta_old(end)) + 1e-3*ones(size(batch,1));
+    % Sigma points
+    [ w, eta_hat ] = drawsigmapoints(5, mu_eta_old, C_eta_old);
+    mu_p_i = zeros(size(basisVector,1)+length(eta_old), size(eta_hat,2));
+    
+    % Inference
+    Cp = zeros(size(mu_p_i,1));
+    J_eta = Ks/K;
+    A_eta = [ eye(size(basisVector,1)); J_eta, zeros(size(J_eta,1), size(eta_old,1)) ];
+    S = Cg_eta_old/C_eta_old;
+    for jj = 1:size(eta_hat,2)
+        tmp = [ mu_g_old + S*(eta_hat(:,jj) - mu_eta_old); eta_hat(:,jj) ];
+        % for now leaving out the noise...
+        mu_p_i(:,jj) = w(jj)*A_eta*tmp;
+    end
+    mu_p = sum(mu_p_i,2);
+    for jj = 1:size(eta_hat,2)
+        tmp = zeros(size(A_eta,2),size(A_eta,2));
+        tmp(1:size(Cg_old),1:size(Cg_old)) = Cg_old - S*C_eta_g_old;
+        Cp_i = A_eta*tmp*A_eta';
+        Cp = Cp + w(jj)*((mu_p_i(:,jj) - mu_p)*(mu_p_i(:,jj) - mu_p)' + Cp_i);
+    end
+    
+    % Update
+    Co_y = blkdiag(Cp(end,end), Cp(1:size(basisVector,1), 1:size(basisVector,1)));
+    Cy = Cp(1:size(basisVector,1), 1:size(basisVector,1)) + mu_p(end)^2 + Cp(end,end);
+    G = Co_y/Cy;
+    
+end
 
 function K = kernelFnct(x1, x2, l, sigm)
 
 %     K = sigm*exp(-pdist2(x1, x2).^2/(2*l^2)); % Basis function (RBF kernel)
 %     K = sigm*exp(-(x1 - x2)*l*(x1 - x2)');
+
     % Trying different kernels...
     % Matern 5/2
 %     K = (1 + sqrt(5)/l*pdist2(x1, x2) + 5/(3*l)*pdist2(x1, x2).^2).*exp(-sqrt(5)/l*pdist2(x1, x2));
-    % NN kernel
+
+    % NN+RBF kernel
     K = zeros(size(x1,1),size(x2,1));
     for ii = 1:size(x1,1)
         for jj = 1:size(x2,1)
@@ -331,7 +380,23 @@ function K = kernelFnct(x1, x2, l, sigm)
 %             Knn(ii,jj) = sigm*asin(x1(ii,:)*x2(jj,:)'*l^(-2)./denom);
         end
     end
-%     denom = sqrt((1 + x1*x1'*l^(-2))*(1 + x2*x2*l^(-2)));
+
 %     K = K + Knn*0;
     
+end
+
+function [ weights, points ] = drawsigmapoints(numParam, mean, var)
+    
+    weights = ones(numParam*2,1);
+    points = zeros(numParam, numParam*2); % column vectors as sigma points
+    
+    L = chol(var, 'lower');
+    points(:,1) = mean;
+    for ii = 2:numParam
+        points(:,ii) = mean + L(:,ii);
+    end
+    for ii = numParam+1:2*numParam
+        points(:,ii) = mean - L(:,ii);
+    end
+    weights = weights/(numParam*2);
 end
